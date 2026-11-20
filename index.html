@@ -33,6 +33,7 @@ canvas{width:100%;height:150px;display:block}
 <span class="px" id="px">-</span>
 <span id="st">connecting...</span>
 </header>
+<div id="dg" class="d" style="padding:4px 12px;font-size:11px"></div>
 <main>
 <section class="c"><h2>Resolution grid: last 48 ticks (tile = last digit)</h2><div class="grid" id="grid"></div></section>
 <section class="c"><h2>Price, last 200 ticks</h2><canvas id="cp"></canvas></section>
@@ -68,26 +69,45 @@ let ws,pip=2,ticks=[],digs=[],cnt=0,run=false,pend=null,tr=[],eq=[0],raf=0,mainI
 const P=()=>(+$('pay').value||95)/100,S=()=>+$('stk').value||1,K=()=>+$('k').value||3,N=()=>Math.max(1,+$('n').value||1);
 const dg=q=>+q.toFixed(pip).slice(-1);
 
+const EP=[['new','wss://api.derivws.com/trading/v1/options/ws/public'],['legacy','wss://ws.derivws.com/websockets/v3?app_id=1089']];
+let ei=0,gotMsg=false,nmsg=0,lastErr='',lastMsgAt=0,lastEp=0,SCS=new Set();
+const send=o=>{if(ws&&ws.readyState==1)ws.send(JSON.stringify(o))};
+const dbg=()=>{$('dg').textContent=`endpoint: ${EP[ei][0]} API, ${nmsg} messages received${lastErr?', last problem: '+lastErr:''}`};
+const dec=v=>v>=1?v:Math.round(-Math.log10(v));
+const decOf=a=>a.slice(-50).reduce((m,p)=>Math.max(m,(String(p).split('.')[1]||'').length),0);
 function connect(){
- ws=new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
- ws.onopen=()=>{$('st').textContent='live';ws.send(JSON.stringify({active_symbols:'brief',product_type:'basic'}));sub()};
- ws.onclose=()=>{$('st').textContent='reconnecting...';setTimeout(connect,2000)};
- ws.onmessage=e=>{
-  const m=JSON.parse(e.data);
-  if(m.error){const f=m.echo_req&&wait[m.echo_req.req_id];if(f){delete wait[m.echo_req.req_id];f([]);return}$('st').textContent=m.error.message;return}
-  if(m.msg_type=='active_symbols'){loadSyms(m.active_symbols);return}
-  if(m.candles){const f=wait[m.req_id];if(f){delete wait[m.req_id];f(m.candles)}return}
-  if(m.history){if(m.echo_req.ticks_history!==sym)return;mainId=m.subscription&&m.subscription.id;pip=m.pip_size||2;ticks=m.history.prices.map(Number);digs=ticks.map(dg);cnt+=ticks.length;draw()}
-  else if(m.tick){
-   if(m.echo_req.ticks_history){if(m.tick.symbol===sym){mainId=(m.subscription&&m.subscription.id)||mainId;pip=m.tick.pip_size||pip;onTick(+m.tick.quote)}}
-   else scan(m.tick);
-  }
- };
+ gotMsg=false;let me;
+ try{me=ws=new WebSocket(EP[ei][1])}catch(e){lastErr=e.message;ei=(ei+1)%EP.length;setTimeout(connect,2000);return}
+ $('st').textContent='connecting ('+EP[ei][0]+' API)...';dbg();
+ const to=setTimeout(()=>{if(!gotMsg){lastErr='no response in 8s';me.close()}},8000);
+ me.onopen=()=>{$('st').textContent='live ('+EP[ei][0]+' API)';send({active_symbols:'brief'});sub();
+  setTimeout(()=>{if(me===ws&&!SCS.size){SCS=new Set(SY.map(x=>x[0]));send({ticks:[...SCS],subscribe:1})}},4000)};
+ me.onerror=()=>{lastErr='socket error'};
+ me.onclose=()=>{clearTimeout(to);if(me!==ws)return;if(!gotMsg){lastErr=lastErr||'connection closed before any data';ei=(ei+1)%EP.length}$('st').textContent='reconnecting...';dbg();setTimeout(connect,gotMsg?1500:2500)};
+ me.onmessage=e=>{if(!gotMsg)lastErr='';gotMsg=true;nmsg++;lastMsgAt=Date.now();let m;try{m=JSON.parse(e.data)}catch(x){return}onMsg(m)};
+}
+function onMsg(m){
+ if(m.error){
+  const f=m.echo_req&&wait[m.echo_req.req_id];if(f){delete wait[m.echo_req.req_id];f([]);return}
+  lastErr=(m.error.code?m.error.code+': ':'')+m.error.message;$('st').textContent=m.error.message;dbg();return}
+ const t=m.msg_type;
+ if(t=='active_symbols'){loadSyms(m.active_symbols);return}
+ if(m.candles&&t!='ohlc'){const f=wait[m.req_id];if(f){delete wait[m.req_id];f(m.candles)}return}
+ if(m.history){
+  if(m.echo_req&&m.echo_req.ticks_history&&m.echo_req.ticks_history!==sym)return;
+  mainId=(m.subscription&&m.subscription.id)||mainId;
+  ticks=m.history.prices.map(Number);pip=dec(m.pip_size)||decOf(ticks)||2;digs=ticks.map(dg);cnt+=ticks.length;
+  lastEp=(m.history.times||[]).slice(-1)[0]||0;draw();return}
+ const tk=m.tick;if(!tk)return;
+ const id=tk.symbol||tk.underlying_symbol,q=+(tk.quote!=null?tk.quote:tk.bid);
+ if(!id||isNaN(q))return;
+ scan(id,q,tk.epoch,dec(tk.pip_size));
+ if(id===sym&&!(tk.epoch&&tk.epoch<=lastEp)){lastEp=tk.epoch||lastEp;if(tk.pip_size)pip=dec(tk.pip_size)||pip;onTick(q)}
 }
 function sub(){
- if(mainId)ws.send(JSON.stringify({forget:mainId}));
+ if(mainId)send({forget:mainId});
  mainId=null;ticks=[];digs=[];pend=null;
- ws.send(JSON.stringify({ticks_history:sym,count:1000,end:'latest',style:'ticks',subscribe:1}));
+ send({ticks_history:sym,count:1000,end:'latest',style:'ticks',subscribe:1});
 }
 function onTick(q){
  ticks.push(q);digs.push(dg(q));cnt++;
@@ -204,7 +224,7 @@ function sim(E,B,c){
 
 const wait={},CK={};let rid=100,RES={};
 function cd(s,g){const k=s+g;if(CK[k])return Promise.resolve(CK[k]);
- return new Promise(res=>{const id=++rid;wait[id]=x=>{if(x.length)CK[k]=x;res(x)};setTimeout(()=>{if(wait[id]){delete wait[id];res([])}},20000);ws.send(JSON.stringify({ticks_history:s,style:'candles',granularity:g,count:5000,end:'latest',req_id:id}))})}
+ return new Promise(res=>{const id=++rid;wait[id]=x=>{if(x.length)CK[k]=x;res(x)};setTimeout(()=>{if(wait[id]){delete wait[id];res([])}},20000);send({ticks_history:s,style:'candles',granularity:g,count:5000,end:'latest',req_id:id})})}
 async function bt(s,alt){
  const key=s.replace(/^1HZ(\d+)V$/,'R_$1'),P=PB[key];if(!P)return null;
  const c={...(alt?P.s:P.p),cap:CAP[key]};
@@ -227,19 +247,20 @@ async function runBT(list){
 $('b1').onclick=()=>runBT([sym]);
 $('b2').onclick=()=>runBT(['R_10','R_25','R_50','R_75','R_100','1HZ10V','1HZ25V','1HZ50V','1HZ75V','1HZ100V']);
 function loadSyms(a){
- a=a.filter(x=>!x.is_trading_suspended&&x.exchange_is_open);
- const g={};a.forEach(x=>(g[x.market_display_name]=g[x.market_display_name]||[]).push(x));
- a.forEach(x=>NM[x.symbol]=x.display_name);
- $('sym').innerHTML=Object.keys(g).map(k=>`<optgroup label="${k}">${g[k].map(x=>`<option value="${x.symbol}">${x.display_name}</option>`).join('')}</optgroup>`).join('');
+ a=(a||[]).map(x=>({id:x.underlying_symbol||x.symbol,name:x.underlying_symbol_name||x.display_name||x.underlying_symbol||x.symbol,mk:x.market||'',grp:x.market_display_name||(x.market||'other').replace(/_/g,' '),open:x.exchange_is_open,susp:x.is_trading_suspended})).filter(x=>x.id&&x.open!==0&&!x.susp);
+ if(!a.length)return;
+ const g={};a.forEach(x=>{(g[x.grp]=g[x.grp]||[]).push(x);NM[x.id]=x.name});
+ $('sym').innerHTML=Object.keys(g).map(k=>`<optgroup label="${k}">${g[k].map(x=>`<option value="${x.id}">${x.name}</option>`).join('')}</optgroup>`).join('');
  $('sym').value=sym;if(!$('sym').value)$('sym').selectedIndex=0;
  if($('sym').value!==sym){sym=$('sym').value;sub()}
- $('st').textContent='live, '+a.length+' markets open';
- const sc=a.filter(x=>x.market==='synthetic_index').map(x=>x.symbol);
- if(sc.length)ws.send(JSON.stringify({ticks:sc,subscribe:1}));
+ $('st').textContent='live ('+EP[ei][0]+' API), '+a.length+' markets open';
+ const sc=a.filter(x=>x.mk==='synthetic_index'||/^(R_|1HZ|BOOM|CRASH|JD|stpRNG|RDBEAR|RDBULL)/.test(x.id)).map(x=>x.id).slice(0,40);
+ if(sc.length){SCS=new Set(sc);send({ticks:sc,subscribe:1})}
 }
-function scan(t){
- const q=+t.quote,o=SC[t.symbol]||(SC[t.symbol]={d:[],q:0,p:2});
- o.p=t.pip_size||o.p;o.q=q;o.d.push(+q.toFixed(o.p).slice(-1));
+function scan(id,q,ep,pp){
+ const o=SC[id]||(SC[id]={d:[],q:0,p:2,ep:0});
+ if(ep&&ep<=o.ep)return;o.ep=ep||o.ep;
+ o.p=pp||o.p;o.q=q;o.d.push(+q.toFixed(o.p).slice(-1));
  if(o.d.length>300)o.d.shift();
  if(!raf)raf=requestAnimationFrame(draw);
 }
@@ -311,7 +332,7 @@ function draw(){
  <div class="row"><span>Max drawdown</span><span class="r">-${mdd.toFixed(2)}</span></div>
  <div class="row"><span>Verdict</span><span class="${cl}">${v}</span></div>`;
  line('ce',eq,pnl>=0?'#22d17b':'#ff4d5e');
- const rs=Object.keys(SC).filter(k=>SC[k].d.length>=100).map(k=>{const o=SC[k],c=Array(10).fill(0);o.d.forEach(d=>c[d]++);const e=o.d.length/10,m=Math.max(...c);return{k,o,chi:c.reduce((a,v)=>a+(v-e)*(v-e)/e,0),hd:c.indexOf(m),hp:m/o.d.length*100}}).sort((a,b)=>b.chi-a.chi);
+ const rs=Object.keys(SC).filter(k=>SCS.has(k)&&SC[k].d.length>=100).map(k=>{const o=SC[k],c=Array(10).fill(0);o.d.forEach(d=>c[d]++);const e=o.d.length/10,m=Math.max(...c);return{k,o,chi:c.reduce((a,v)=>a+(v-e)*(v-e)/e,0),hd:c.indexOf(m),hp:m/o.d.length*100}}).sort((a,b)=>b.chi-a.chi);
  if(rs.length){
   $('sc').innerHTML=rs.slice(0,12).map(r=>`<div class="row sr" data-k="${r.k}"><span>${NM[r.k]||r.k}</span><span>${r.o.q.toFixed(r.o.p)}</span><span>top digit ${r.hd}: ${r.hp.toFixed(1)}%</span><span class="${r.chi>16.9?'y':'d'}">chi ${r.chi.toFixed(1)}</span></div>`).join('');
   $('scn').textContent=`${rs.filter(r=>r.chi>16.9).length} of ${rs.length} markets above the 5% line; about ${(rs.length*.05).toFixed(1)} would be by chance alone. A flag is a lead to forward-test, not a signal.`;
@@ -321,9 +342,10 @@ const pick=k=>{sym=k;$('sym').value=k;try{localStorage.dm_sym=k}catch(e){}sub()}
 $('sym').onchange=e=>pick(e.target.value);
 $('sc').onpointerdown=e=>{const r=e.target.closest('.sr');if(r)pick(r.dataset.k)};
 $('exp').onclick=()=>{const b=new Blob(['symbol,side,win,pnl\n'+tr.map(t=>[t.s,t.side,t.w?1:0,t.p.toFixed(2)].join(',')).join('\n')],{type:'text/csv'}),a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='paper-trades.csv';a.click()};
-setInterval(()=>{if(ws&&ws.readyState==1)ws.send('{"ping":1}')},30000);
+setInterval(()=>{send({ping:1});if(ws&&ws.readyState==1&&lastMsgAt&&Date.now()-lastMsgAt>25000){lastErr='no data for 25s, reconnecting';ws.close()}dbg()},10000);
 $('run').onclick=()=>{run=!run;$('run').textContent=run?'Pause':'Start';$('run').classList.toggle('on',run)};
 $('rst').onclick=()=>{tr=[];eq=[0];pend=null;$('log').innerHTML='';draw()};
 addEventListener('resize',draw);
+setInterval(dbg,1500);
 connect();
 </script></body></html>
